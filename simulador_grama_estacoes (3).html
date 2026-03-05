@@ -1,0 +1,1198 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Grama 7×7 · Estações</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#020804;
+    display:flex; align-items:center; justify-content:center;
+    min-height:100vh; overflow:hidden;
+    font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  }
+  #stage { position:relative; width:940px; height:610px; }
+  canvas { position:absolute; inset:0; display:block; }
+
+  #controls {
+    position:absolute;
+    bottom:14px;
+    left:50%;
+    transform:translateX(-50%);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:6px;
+    z-index:10;
+  }
+  .ctrl-row { display:flex; gap:8px; }
+  .build-btn {
+    background:rgba(0,0,0,0.65);
+    border:1px solid rgba(160,180,200,0.25);
+    color:rgba(160,185,210,0.65);
+    font-family:'Courier New', monospace;
+    font-size:11px;
+    letter-spacing:1px;
+    padding:6px 16px;
+    border-radius:4px;
+    cursor:pointer;
+    transition:all 0.2s;
+  }
+  .build-btn:hover {
+    border-color:rgba(160,200,255,0.6);
+    color:rgba(190,220,255,0.95);
+    background:rgba(10,20,35,0.80);
+  }
+  .build-btn.active {
+    background:rgba(100,150,220,0.18);
+    border-color:rgba(140,190,255,0.85);
+    color:rgba(200,225,255,1);
+    box-shadow:0 0 8px rgba(100,160,255,0.35);
+  }
+  .speed-btn {
+    background:rgba(0,0,0,0.65);
+    border:1px solid rgba(110,235,90,0.25);
+    color:rgba(110,235,90,0.55);
+    font-family:'Courier New', monospace;
+    font-size:11px;
+    letter-spacing:2px;
+    padding:6px 18px;
+    border-radius:4px;
+    cursor:pointer;
+    transition:all 0.2s;
+    text-transform:uppercase;
+  }
+  .speed-btn:hover {
+    border-color:rgba(110,235,90,0.7);
+    color:rgba(130,255,110,0.9);
+    background:rgba(0,20,0,0.75);
+  }
+  .speed-btn.active {
+    background:rgba(110,235,90,0.13);
+    border-color:rgba(110,235,90,0.85);
+    color:rgba(160,255,130,1);
+  }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+
+<body>
+<div id="stage">
+  <canvas id="bg-canvas"   width="940" height="610"></canvas>
+  <canvas id="webgl-canvas" width="940" height="610"></canvas>
+  <canvas id="hud-canvas"  width="940" height="610"></canvas>
+  <div id="controls">
+    <div class="ctrl-row">
+      <button class="speed-btn active" id="btn1"  onclick="setSpeed(1)" >⏱ 1×</button>
+      <button class="speed-btn"        id="btn10" onclick="setSpeed(10)">⚡ 10×</button>
+      <button class="speed-btn"        id="btn60" onclick="setSpeed(60)">🔥 60×</button>
+    </div>
+    <div class="ctrl-row">
+      <button class="build-btn" id="tool-vila"    onclick="setTool('vila')"   >🧑‍🦲 Vila</button>
+      <button class="build-btn" id="tool-mina"    onclick="setTool('mina')"   >🪨 Mina</button>
+      <button class="build-btn" id="tool-fazenda" onclick="setTool('fazenda')">🌱 Fazenda</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* ── CONFIG ─────────────────────────────── */
+const W=940, H=610;
+const GRID=7, TILE=44, BPT=250, LAYERS=50, REGION_N=4, SEG=3;
+const MIN_H=10, MAX_H=200;
+const VTICKS_BASE   = 100;
+const GROWTH_P      = 0.00025;
+const GROWTH_AMT    = 0.006;
+const TEMP_GLOBAL_SPEED = 0.18;
+const TEMP_DIFFUSE      = 0.0032;
+const TEMP_INERTIA      = 0.015;
+const SEED = 1337;
+const CX=W/2, CY=76, IX=1.42, IZ=0.71, IY=0.95;
+
+/* ── ESTAÇÕES (em minutos simulados) ─────
+   1 ciclo = 240 min simulados
+   a 1× real:  240 min = 4 horas
+   a 10×:  240 min = 24 min reais
+   a 60×:  240 min = 4 min reais          */
+const CYCLE_MINS   = 240;
+const SUMMER_END   = 120;   // verão:   0 → 120 min
+const AUTUMN_END   = 180;   // outono: 120 → 180 min
+const WINTER_END   = 210;   // inverno:180 → 210 min
+const SPRING_END   = 240;   // primav: 210 → 240 min
+// vticks por minuto simulado a 1×: 60fps × 100 = 6000 vtick/s = 360 000/min
+const VTICKS_PER_MIN = 360_000;
+
+/* ── ESTADO GLOBAL ──────────────────────── */
+let simSpeed = 1;
+let vtTotal  = 0;
+let growths  = 0;
+
+let seasonName  = 'Verão';
+let wiltMult    = 1.0;   // 1 = normal, 0 = grama sumiu
+let winterness  = 0.0;   // 0 = verde, 1 = morta/marrom
+let prevPhase   = 'summer';
+let springDone  = false; // evita reset duplo
+
+/* ── UTILS ──────────────────────────────── */
+const clamp   = (x,a,b) => Math.max(a, Math.min(b, x));
+const clamp01 = x => clamp(x, 0, 1);
+const projX   = (wx,wz)    => CX + (wx - wz) * IX;
+const projY   = (wx,wy,wz) => CY + (wx + wz) * IZ - wy * IY;
+
+function hash32(n) {
+  n=(n^61)^(n>>>16); n=(n+(n<<3))|0;
+  n=(n^(n>>>4))|0; n=Math.imul(n,0x27d4eb2d);
+  return (n^(n>>>15))>>>0;
+}
+function rand01(a,b,c) {
+  return hash32(((a*73856093)^(b*19349663)^(c*83492791)^SEED)|0)/4294967295;
+}
+function windAt(wx,wz,t) {
+  return Math.sin(t*0.00075+wx*0.028+wz*0.016)*0.55
+       + Math.sin(t*0.0022 +wx*0.048-wz*0.026)*0.28
+       + Math.sin(t*0.0090 +wx*0.095+wz*0.052)*0.10
+       + Math.cos(t*0.0017 -wz*0.036          )*0.07;
+}
+function heightWeight(h) { return 1/(3*Math.log10(Math.max(1.001,h/10))); }
+function tempIdealFactor(t) { return clamp01(1.0 - Math.abs(t-0.5)/0.5); }
+
+/* ── TILE DATA ──────────────────────────── */
+const tileData = [];
+for (let ti=0; ti<GRID; ti++) for (let tj=0; tj<GRID; tj++) {
+  tileData.push({
+    ti, tj, blades: [],
+    regionSum: new Float32Array(REGION_N*REGION_N),
+    regionFertility: new Float32Array(REGION_N*REGION_N),
+    maxRegion: 0, totalHeight: 0,
+    climateBias: (rand01(ti,tj,777)-0.5)*0.22
+  });
+}
+
+function initTileFertility(td) {
+  const tmp = new Float32Array(REGION_N*REGION_N);
+  const {ti,tj} = td;
+  for (let r=0; r<tmp.length; r++) {
+    tmp[r] = 0.35 + Math.pow(rand01(ti,tj,1000+r), 1.35)*1.35;
+  }
+  for (let pass=0; pass<2; pass++) {
+    for (let y=0; y<REGION_N; y++) for (let x=0; x<REGION_N; x++) {
+      let sum=0, c=0;
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+        const xx=x+dx, yy=y+dy;
+        if (xx<0||xx>=REGION_N||yy<0||yy>=REGION_N) continue;
+        sum+=tmp[yy*REGION_N+xx]; c++;
+      }
+      td.regionFertility[y*REGION_N+x] = sum/c;
+    }
+    tmp.set(td.regionFertility);
+  }
+  for (let r=0; r<td.regionFertility.length; r++)
+    td.regionFertility[r] = clamp(td.regionFertility[r], 0.40, 1.60);
+}
+
+const scratchW = new Float32Array(BPT);
+function weightedPick(td) {
+  const b=td.blades, n=b.length, rs=td.regionSum, mr=td.maxRegion;
+  let total=0;
+  for (let i=0;i<n;i++) {
+    const bl=b[i];
+    const rf = mr>0 ? Math.max(0,1-rs[bl.ri]/mr) : 1;
+    const w = heightWeight(bl.height)*(0.22+0.78*rf)*(0.55+0.45*td.regionFertility[bl.ri]);
+    scratchW[i]=w; total+=w;
+  }
+  let r=Math.random()*total;
+  for (let i=0;i<n;i++) { r-=scratchW[i]; if (r<=0) return i; }
+  return n-1;
+}
+
+/* ── BLADE ──────────────────────────────── */
+class BladeLogic {
+  constructor(ti, tj, li, index) {
+    this.index = index;
+    const oxW=tj*TILE, ozW=ti*TILE;
+    this.wx = oxW + 4 + Math.random()*(TILE-8);
+    this.wz = ozW + li*(TILE/LAYERS) + Math.random()*(TILE/LAYERS);
+    this.height = MIN_H + Math.random()*(24-MIN_H);
+    this.ri = computeRI(this, ti, tj);
+  }
+}
+function computeRI(blade, ti, tj) {
+  const oxW=tj*TILE, ozW=ti*TILE;
+  const lx=blade.wx-oxW, lz=blade.wz-ozW;
+  return (Math.min(REGION_N-1,(lz/TILE*REGION_N)|0))*REGION_N
+        + Math.min(REGION_N-1,(lx/TILE*REGION_N)|0);
+}
+
+/* ── GPU BUFFERS ────────────────────────── */
+const TOTAL_BLADES = GRID*GRID*BPT;
+const offsetsArray = new Float32Array(TOTAL_BLADES*2);
+const heightsArray = new Float32Array(TOTAL_BLADES);
+const anglesArray  = new Float32Array(TOTAL_BLADES);
+const bwsArray     = new Float32Array(TOTAL_BLADES);
+const swaysArray   = new Float32Array(TOTAL_BLADES);
+const phasesArray  = new Float32Array(TOTAL_BLADES);
+const colBsArray   = new Float32Array(TOTAL_BLADES*3);
+const colMsArray   = new Float32Array(TOTAL_BLADES*3);
+const colTsArray   = new Float32Array(TOTAL_BLADES*3);
+
+/* preenche arrays de uma lâmina (chamado no spawn inicial e no spring reset) */
+function fillBlade(i, blade, li) {
+  offsetsArray[i*2]   = blade.wx;
+  offsetsArray[i*2+1] = blade.wz;
+  heightsArray[i]     = blade.height;
+  anglesArray[i]  = Math.random()*Math.PI;
+  bwsArray[i]     = 0.5 + Math.random()*0.95;
+  swaysArray[i]   = 0.35 + Math.random()*0.9;
+  phasesArray[i]  = Math.random()*Math.PI*2;
+  const df = 0.65 + (li/(LAYERS-1))*0.35;
+  const v  = Math.random()*0.28;
+  const rr = x => Math.floor(x*df)/255.0;
+  colBsArray[i*3]   = rr(8+v*12);  colBsArray[i*3+1] = rr(60+v*35); colBsArray[i*3+2] = rr(6+v*6);
+  colMsArray[i*3]   = rr(14+v*16); colMsArray[i*3+1] = rr(110+v*55);colMsArray[i*3+2] = rr(10+v*8);
+  colTsArray[i*3]   = rr(50+v*65); colTsArray[i*3+1] = rr(165+v*55);colTsArray[i*3+2] = rr(28+v*28);
+}
+
+/* spawn inicial */
+for (let idx=0; idx<tileData.length; idx++) initTileFertility(tileData[idx]);
+let globalIndex=0;
+for (let idx=0; idx<tileData.length; idx++) {
+  const td=tileData[idx];
+  const {ti,tj}=td;
+  let rem=BPT;
+  for (let li=0; li<LAYERS; li++) {
+    const left=LAYERS-li;
+    const count = li===LAYERS-1 ? rem
+      : Math.max(1,Math.min(10,Math.round(rem/left)+((Math.random()*3|0)-1)));
+    for (let b=0;b<count;b++) {
+      const blade = new BladeLogic(ti,tj,li,globalIndex);
+      td.blades.push(blade);
+      td.regionSum[blade.ri] += blade.height;
+      td.totalHeight += blade.height;
+      fillBlade(globalIndex, blade, li);
+      globalIndex++;
+    }
+    rem -= count; if (rem<=0) break;
+  }
+  for (let r=0;r<td.regionSum.length;r++)
+    if (td.regionSum[r]>td.maxRegion) td.maxRegion=td.regionSum[r];
+}
+
+/* ── TEMPERATURA ────────────────────────── */
+const tempA=new Float32Array(GRID*GRID).fill(0.55);
+const tempB=new Float32Array(GRID*GRID);
+let tempR=tempA, tempW=tempB;
+function getTempIdeal(idx) { return tempIdealFactor(tempR[idx]); }
+function growthSpeedMult(idx) { return 0.15 + 1.35*getTempIdeal(idx); }
+function updateTemps(vt) {
+  const cg = 0.5 + Math.sin(vt*TEMP_GLOBAL_SPEED)*0.42;
+  for (let i=0;i<GRID;i++) for (let j=0;j<GRID;j++) {
+    const idx=i*GRID+j, td=tileData[idx];
+    const target = clamp01(cg + td.climateBias - (td.totalHeight/BPT/MAX_H)*0.16);
+    let t = tempR[idx] + (target-tempR[idx])*TEMP_INERTIA;
+    let nsum=0, nc=0;
+    if(i>0){nsum+=tempR[(i-1)*GRID+j];nc++;}
+    if(i<GRID-1){nsum+=tempR[(i+1)*GRID+j];nc++;}
+    if(j>0){nsum+=tempR[i*GRID+(j-1)];nc++;}
+    if(j<GRID-1){nsum+=tempR[i*GRID+(j+1)];nc++;}
+    if(nc>0) t += (nsum/nc-t)*TEMP_DIFFUSE;
+    tempW[idx] = clamp01(t);
+  }
+  [tempR,tempW]=[tempW,tempR];
+}
+
+/* ── THREE.JS / WebGL ───────────────────── */
+const webglCanvas = document.getElementById('webgl-canvas');
+const renderer = new THREE.WebGLRenderer({canvas:webglCanvas, alpha:true, antialias:false});
+renderer.setSize(W,H);
+renderer.setClearColor(0x000000,0);
+const scene  = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1,1,1,-1,0.1,10);
+camera.position.z = 1;
+
+const geometry = new THREE.PlaneGeometry(1,1,1,SEG);
+geometry.translate(0,0.5,0);
+geometry.setAttribute('aOffset', new THREE.InstancedBufferAttribute(offsetsArray,2));
+const aHeight = new THREE.InstancedBufferAttribute(heightsArray,1);
+aHeight.setUsage(THREE.DynamicDrawUsage);
+geometry.setAttribute('aHeight', aHeight);
+geometry.setAttribute('aAngle',  new THREE.InstancedBufferAttribute(anglesArray,1));
+geometry.setAttribute('aBw',     new THREE.InstancedBufferAttribute(bwsArray,1));
+geometry.setAttribute('aSway',   new THREE.InstancedBufferAttribute(swaysArray,1));
+geometry.setAttribute('aPhase',  new THREE.InstancedBufferAttribute(phasesArray,1));
+geometry.setAttribute('aColB',   new THREE.InstancedBufferAttribute(colBsArray,3));
+geometry.setAttribute('aColM',   new THREE.InstancedBufferAttribute(colMsArray,3));
+geometry.setAttribute('aColT',   new THREE.InstancedBufferAttribute(colTsArray,3));
+
+const material = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime:       {value:0},
+    uW:          {value:W},
+    uH:          {value:H},
+    uWiltMult:   {value:1.0},   // escala a altura visual (1=normal, 0=invisível)
+    uWinterness: {value:0.0},   // 0=verde, 1=morta/marrom
+  },
+  vertexShader:`
+    uniform float uTime, uW, uH, uWiltMult;
+    attribute vec2 aOffset;
+    attribute float aHeight, aAngle, aBw, aSway, aPhase;
+    attribute vec3 aColB, aColM, aColT;
+    varying vec3 vColor;
+    void main(){
+      float f=position.y;
+      float b=f*f;
+      float wx=aOffset.x, wz=aOffset.y;
+      float windVal=
+        sin(uTime*0.00075+wx*0.028+wz*0.016)*0.55+
+        sin(uTime*0.0022 +wx*0.048-wz*0.026)*0.28+
+        sin(uTime*0.0090 +wx*0.095+wz*0.052)*0.10+
+        cos(uTime*0.0017 -wz*0.036          )*0.07;
+      float amp   = aHeight*0.50*aSway;
+      float micro = sin(uTime*0.0055+aPhase)*aHeight*0.028;
+      float tbx = windVal*amp*0.85+micro;
+      float tbz = windVal*amp*0.20;
+      float px=sin(aAngle), pz=cos(aAngle);
+      float hw=aBw*(1.0-f*0.88);
+      /* aplica o wilt: encolhe a grama visualmente sem tocar no buffer de altura */
+      float effectiveH = aHeight * uWiltMult;
+      float bxc=wx+tbx*b, bzc=wz+tbz*b, byc=f*effectiveH;
+      float finalWx=bxc+px*hw*position.x*2.0;
+      float finalWz=bzc+pz*hw*position.x*2.0;
+      float CX=uW/2.0, CY=76.0, IX=1.42, IZ=0.71, IY=0.95;
+      float scrX=CX+(finalWx-finalWz)*IX;
+      float scrY=CY+(finalWx+finalWz)*IZ-byc*IY;
+      float ndcX=(scrX/uW)*2.0-1.0;
+      float ndcY=-(scrY/uH)*2.0+1.0;
+      float ndcZ=1.0-(wx+wz+byc*0.06)/1000.0;
+      gl_Position=vec4(ndcX,ndcY,ndcZ,1.0);
+      if(f<0.48) vColor=mix(aColB,aColM,f/0.48);
+      else       vColor=mix(aColM,aColT,(f-0.48)/0.52);
+    }
+  `,
+  fragmentShader:`
+    uniform float uWinterness;
+    varying vec3 vColor;
+    void main(){
+      /* palha seca no inverno, verde vivo no verão */
+      vec3 deadColor = vec3(0.26, 0.19, 0.05);
+      gl_FragColor = vec4(mix(vColor, deadColor, uWinterness), 1.0);
+    }
+  `,
+  side:THREE.DoubleSide,
+  depthTest:true, depthWrite:true, transparent:true
+});
+
+const instancedGrass = new THREE.InstancedMesh(geometry, material, TOTAL_BLADES);
+scene.add(instancedGrass);
+
+/* ── 2D CANVAS ──────────────────────────── */
+const bgCtx  = document.getElementById('bg-canvas').getContext('2d');
+const hudCtx = document.getElementById('hud-canvas').getContext('2d');
+const tileOrder = [...tileData].sort((a,b)=>(a.ti+a.tj)-(b.ti+b.tj));
+const _cx=new Float32Array(4), _cy=new Float32Array(4);
+
+function drawGround(td, ctx) {
+  const {ti,tj}=td;
+  const ox=tj*TILE, oz=ti*TILE;
+  _cx[0]=projX(ox,oz);          _cy[0]=projY(ox,0,oz);
+  _cx[1]=projX(ox+TILE,oz);     _cy[1]=projY(ox+TILE,0,oz);
+  _cx[2]=projX(ox+TILE,oz+TILE);_cy[2]=projY(ox+TILE,0,oz+TILE);
+  _cx[3]=projX(ox,oz+TILE);     _cy[3]=projY(ox,0,oz+TILE);
+  const t  = tempR[ti*GRID+tj];
+  const wf = winterness;
+  // chão vira terra seca no inverno
+  const gG = Math.floor((24+t*22)*(1-wf) + 15*wf);
+  const gR = Math.floor(( 7+t* 7)*(1-wf) + 22*wf);
+  ctx.fillStyle=`rgb(${gR},${gG},${gR>>1})`;
+  ctx.beginPath();
+  ctx.moveTo(_cx[0],_cy[0]); ctx.lineTo(_cx[1],_cy[1]);
+  ctx.lineTo(_cx[2],_cy[2]); ctx.lineTo(_cx[3],_cy[3]);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='rgba(50,130,30,0.12)'; ctx.lineWidth=0.5; ctx.stroke();
+  const DEP=6;
+  ctx.beginPath();
+  ctx.moveTo(_cx[3],_cy[3]); ctx.lineTo(_cx[2],_cy[2]);
+  ctx.lineTo(projX(ox+TILE,oz+TILE),projY(ox+TILE,-DEP,oz+TILE));
+  ctx.lineTo(projX(ox,oz+TILE),projY(ox,-DEP,oz+TILE));
+  ctx.closePath(); ctx.fillStyle='rgba(3,9,3,0.92)'; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(_cx[2],_cy[2]); ctx.lineTo(_cx[1],_cy[1]);
+  ctx.lineTo(projX(ox+TILE,oz),projY(ox+TILE,-DEP,oz));
+  ctx.lineTo(projX(ox+TILE,oz+TILE),projY(ox+TILE,-DEP,oz+TILE));
+  ctx.closePath(); ctx.fillStyle='rgba(5,13,5,0.88)'; ctx.fill();
+}
+
+function roundRect(ctx,x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.arcTo(x+w,y,x+w,y+r,r);
+  ctx.lineTo(x+w,y+h-r); ctx.arcTo(x+w,y+h,x+w-r,y+h,r);
+  ctx.lineTo(x+r,y+h); ctx.arcTo(x,y+h,x,y+h-r,r);
+  ctx.lineTo(x,y+r); ctx.arcTo(x,y,x+r,y,r);
+  ctx.closePath();
+}
+
+const SEASON_STYLE = {
+  'Verão':     {r:110,g:235,b:90,  icon:'☀️ '},
+  'Outono':    {r:227,g:179,b:65,  icon:'🍂 '},
+  'Inverno':   {r:121,g:192,b:255, icon:'❄️ '},
+  'Primavera': {r:160,g:255,b:120, icon:'🌱 '},
+};
+
+let fps=60, _fpsLast=0, _fpsFrames=0;
+
+let hudExpanded = false;
+let money = 5000;
+
+// ── Recompensas ───────────────────────────────────────────────────────────
+const REWARD_INTERVAL_MINS = 9;          // recompensa manual a cada 9 min simulados
+const REWARD_MANUAL = 100;
+const REWARD_SPRING = 1000;
+
+let lastRewardMin   = 0;      // último minuto simulado em que a recompensa foi gerada
+let manualReady     = false;  // há recompensa disponível para coletar
+let springReady     = false;  // recompensa de primavera disponível
+let rewardNotifTs   = -9999;  // timestamp da última notificação (para animação)
+let rewardNotifAmt  = 0;
+const HUD_BTN = { x:10, y:10, w:22, h:22 }; // botão toggle
+
+document.getElementById('hud-canvas').addEventListener('click', e => {
+  const rect = e.target.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) * (W / rect.width);
+  const sy = (e.clientY - rect.top)  * (H / rect.height);
+  if (sx >= HUD_BTN.x && sx <= HUD_BTN.x+HUD_BTN.w &&
+      sy >= HUD_BTN.y && sy <= HUD_BTN.y+HUD_BTN.h) {
+    hudExpanded = !hudExpanded;
+    return;
+  }
+  // Recompensas
+  if (REWARD_BTNS.manual && sx >= REWARD_BTNS.manual.x && sx <= REWARD_BTNS.manual.x+REWARD_BTNS.manual.w &&
+      sy >= REWARD_BTNS.manual.y && sy <= REWARD_BTNS.manual.y+REWARD_BTNS.manual.h) { collectManual(); return; }
+  if (REWARD_BTNS.spring && sx >= REWARD_BTNS.spring.x && sx <= REWARD_BTNS.spring.x+REWARD_BTNS.spring.w &&
+      sy >= REWARD_BTNS.spring.y && sy <= REWARD_BTNS.spring.y+REWARD_BTNS.spring.h) { collectSpring(); return; }
+  // restante do click handler original abaixo ↓
+  const {wx, wz} = screenToWorld(sx, sy);
+  const tj = Math.floor(wx / TILE);
+  const ti = Math.floor(wz / TILE);
+  if (ti >= 0 && ti < GRID && tj >= 0 && tj < GRID) {
+    if (activeTool) {
+      placeBuilding(ti, tj);
+    } else {
+      if (selectedTile && selectedTile.ti === ti && selectedTile.tj === tj) {
+        selectedTile = null;
+      } else {
+        selectedTile = {ti, tj};
+      }
+    }
+  } else {
+    selectedTile = null;
+  }
+});
+
+function drawHUD(ctx, ts) {
+  _fpsFrames++;
+  const dt=ts-_fpsLast;
+  if (dt>600) { fps=Math.round(_fpsFrames*1000/dt); _fpsFrames=0; _fpsLast=ts; }
+
+  const simMin   = vtTotal / VTICKS_PER_MIN;
+  const cycleMin = simMin % CYCLE_MINS;
+  const sc = SEASON_STYLE[seasonName] || SEASON_STYLE['Verão'];
+
+  ctx.save();
+
+  // ── Botão toggle ──────────────────────────────────────────────────────────
+  const {x:bx, y:by, w:bw, h:bh} = HUD_BTN;
+  ctx.fillStyle = 'rgba(0,0,0,0.82)';
+  roundRect(ctx, bx, by, bw, bh, 4); ctx.fill();
+  ctx.strokeStyle = `rgba(${sc.r},${sc.g},${sc.b},0.75)`;
+  ctx.lineWidth = 1;
+  roundRect(ctx, bx, by, bw, bh, 4); ctx.stroke();
+  // ícone ▲ / ▼
+  ctx.fillStyle = `rgba(${sc.r},${sc.g},${sc.b},0.9)`;
+  ctx.font = 'bold 10px Courier New';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(hudExpanded ? '▲' : '▼', bx + bw/2, by + bh/2);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+
+  if (!hudExpanded) {
+    // ── Mini HUD: só vigor + ciclo ────────────────────────────────────────
+    const MW = 160, MH = 46, MX = bx + bw + 6, MY = by;
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    roundRect(ctx, MX, MY, MW, MH, 5); ctx.fill();
+    ctx.strokeStyle = `rgba(${sc.r},${sc.g},${sc.b},0.22)`;
+    ctx.lineWidth = 0.8;
+    roundRect(ctx, MX, MY, MW, MH, 5); ctx.stroke();
+
+    // Estação (ícone + nome pequeno)
+    ctx.font = 'bold 9px Courier New';
+    ctx.fillStyle = `rgba(${sc.r},${sc.g},${sc.b},0.95)`;
+    ctx.fillText(`${sc.icon}${seasonName.toUpperCase()}`, MX+8, MY+13);
+
+    // Barra de ciclo
+    const barW = MW - 16;
+    ctx.fillStyle = 'rgba(20,20,20,0.8)';
+    ctx.fillRect(MX+8, MY+18, barW, 5);
+    const segs=[
+      {end:SUMMER_END, r:110,g:235,b:90},
+      {end:AUTUMN_END, r:227,g:179,b:65},
+      {end:WINTER_END, r:100,g:160,b:255},
+      {end:SPRING_END, r:160,g:255,b:120},
+    ];
+    let segX = MX+8;
+    segs.forEach(s => {
+      const sw = (s.end/CYCLE_MINS)*barW - (segX-(MX+8));
+      ctx.fillStyle = `rgba(${s.r},${s.g},${s.b},0.45)`;
+      ctx.fillRect(segX, MY+18, sw, 5);
+      segX += sw;
+    });
+    const curX = MX+8 + (cycleMin/CYCLE_MINS)*barW;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillRect(curX-1, MY+17, 2, 7);
+
+    // Barra de vigor
+    ctx.font = '7px Courier New';
+    ctx.fillStyle = 'rgba(110,235,90,0.45)';
+    ctx.fillText('VIGOR', MX+8, MY+38);
+    ctx.fillStyle = 'rgba(20,20,20,0.8)';
+    ctx.fillRect(MX+38, MY+32, barW-30, 5);
+    ctx.fillStyle = `rgba(${sc.r},${sc.g},${sc.b},0.7)`;
+    ctx.fillRect(MX+38, MY+32, wiltMult*(barW-30), 5);
+
+    ctx.restore();
+    drawMoney(ctx);
+    return;
+  }
+
+  // ── HUD expandido completo ────────────────────────────────────────────────
+  ctx.fillStyle='rgba(0,0,0,0.58)';
+  roundRect(ctx, 10, 10, 300, 168, 7); ctx.fill();
+  ctx.strokeStyle = `rgba(${sc.r},${sc.g},${sc.b},0.22)`;
+  ctx.lineWidth = 0.8;
+  roundRect(ctx, 10, 10, 300, 168, 7); ctx.stroke();
+
+  ctx.font='bold 9px Courier New';
+  ctx.fillStyle=`rgba(${sc.r},${sc.g},${sc.b},0.85)`;
+  ctx.fillText('GRAMA · WEBGL · ESTAÇÕES', 38, 27);
+
+  ctx.font='9px Courier New';
+  ctx.fillStyle='rgba(110,235,90,0.38)';
+  ctx.fillText(`fps             ${fps}`,                          18, 41);
+  ctx.fillText(`velocidade       ${simSpeed}×`,                   18, 54);
+  ctx.fillText(`crescimentos    ${growths.toLocaleString()}`,      18, 67);
+
+  const hh=Math.floor(simMin/60), mm=Math.floor(simMin%60);
+  ctx.fillText(`tempo simulado   ${String(hh).padStart(2,'0')}h${String(mm).padStart(2,'0')}m`, 18, 80);
+  ctx.fillText(`ciclo atual      ${cycleMin.toFixed(1)}/${CYCLE_MINS} min`, 18, 93);
+
+  const wv=windAt(TILE*3.5,TILE*3.5,ts);
+  ctx.fillText(`vento    ${wv>=0?'→':'←'} `, 18, 106);
+  ctx.fillStyle='rgba(20,20,20,0.6)'; ctx.fillRect(78, 98, 52, 8);
+  ctx.fillStyle=wv>=0?'rgba(80,255,100,0.65)':'rgba(100,200,255,0.65)';
+  ctx.fillRect(78, 98, Math.abs(wv)*52, 8);
+
+  ctx.font='bold 12px Courier New';
+  ctx.fillStyle=`rgba(${sc.r},${sc.g},${sc.b},0.95)`;
+  ctx.fillText(`${sc.icon}${seasonName.toUpperCase()}`, 18, 126);
+
+  ctx.fillStyle='rgba(20,20,20,0.7)';
+  ctx.fillRect(18, 135, 278, 7);
+  const segs2=[
+    {end:SUMMER_END, r:110,g:235,b:90},
+    {end:AUTUMN_END, r:227,g:179,b:65},
+    {end:WINTER_END, r:100,g:160,b:255},
+    {end:SPRING_END, r:160,g:255,b:120},
+  ];
+  let sx2=18;
+  segs2.forEach(s => {
+    const segW=(s.end/CYCLE_MINS)*278 - (sx2-18);
+    ctx.fillStyle=`rgba(${s.r},${s.g},${s.b},0.45)`;
+    ctx.fillRect(sx2,135,segW,7); sx2+=segW;
+  });
+  const curX2=18+(cycleMin/CYCLE_MINS)*278;
+  ctx.fillStyle='rgba(255,255,255,0.92)';
+  ctx.fillRect(curX2-1,133,2,11);
+  ctx.font='7px Courier New';
+  ctx.fillStyle='rgba(160,160,160,0.55)';
+  ctx.textAlign='center';
+  ctx.fillText('☀',  18+(SUMMER_END/2/CYCLE_MINS)*278, 150);
+  ctx.fillText('🍂', 18+((SUMMER_END+(AUTUMN_END-SUMMER_END)/2)/CYCLE_MINS)*278, 150);
+  ctx.fillText('❄',  18+((AUTUMN_END+(WINTER_END-AUTUMN_END)/2)/CYCLE_MINS)*278, 150);
+  ctx.fillText('🌱', 18+((WINTER_END+(SPRING_END-WINTER_END)/2)/CYCLE_MINS)*278, 150);
+  ctx.textAlign='left';
+
+  ctx.font='7px Courier New';
+  ctx.fillStyle='rgba(110,235,90,0.32)';
+  ctx.fillText('VIGOR DA GRAMA', 18, 164);
+  ctx.fillStyle='rgba(20,20,20,0.7)'; ctx.fillRect(112, 157, 180, 6);
+  ctx.fillStyle=`rgba(${sc.r},${sc.g},${sc.b},0.6)`;
+  ctx.fillRect(112, 157, wiltMult*180, 6);
+
+  /* heatmap temperatura */
+  const HX=320, HY=10, HS=GRID*9+4;
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  roundRect(ctx,HX,HY,HS,HS+18,6); ctx.fill();
+  for (let i=0;i<GRID;i++) for (let j=0;j<GRID;j++) {
+    const t=tempR[i*GRID+j];
+    ctx.fillStyle=`rgba(${Math.round(53+t*202)},${Math.round(196+t*-89)},${Math.round(255+t*-202)},${0.33+t*0.55})`;
+    ctx.fillRect(HX+2+j*9, HY+2+i*9, 8, 8);
+  }
+  ctx.strokeStyle='rgba(110,235,90,0.12)'; ctx.lineWidth=0.5;
+  ctx.strokeRect(HX+2,HY+2,GRID*9,GRID*9);
+  ctx.fillStyle='rgba(110,235,90,0.28)'; ctx.font='7px Courier New';
+  ctx.textAlign='center';
+  ctx.fillText('TEMP · azul=frio / laranja=quente', HX+HS/2, HY+HS+14);
+  ctx.textAlign='left';
+
+  drawMoney(ctx);
+}
+
+// Hit areas para clicks dos botões de recompensa (atualizado no drawMoney)
+const REWARD_BTNS = { manual: null, spring: null };
+
+function collectManual() {
+  if (!manualReady) return;
+  money += REWARD_MANUAL;
+  manualReady = false;
+  lastRewardMin = vtTotal / VTICKS_PER_MIN;
+  rewardNotifAmt = REWARD_MANUAL;
+  rewardNotifTs  = performance.now();
+}
+function collectSpring() {
+  if (!springReady) return;
+  money += REWARD_SPRING;
+  springReady = false;
+  rewardNotifAmt = REWARD_SPRING;
+  rewardNotifTs  = performance.now();
+}
+
+function drawMoney(ctx) {
+  const ts = performance.now();
+  ctx.save();
+
+  // ── Painel de saldo ──────────────────────────────────────────────────────
+  const moneyStr = '$ ' + money.toFixed(2)
+    .replace(/\B(?=(\d{3})+(?!\d))/g, '.')
+    .replace(/\.(\d{2})$/, ',$1');
+  ctx.font = 'bold 15px Courier New';
+  const mw = ctx.measureText(moneyStr).width + 20;
+  const mx = W - mw - 10, my = 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  roundRect(ctx, mx, my, mw, 26, 5); ctx.fill();
+  ctx.strokeStyle = 'rgba(110,235,90,0.45)';
+  ctx.lineWidth = 1;
+  roundRect(ctx, mx, my, mw, 26, 5); ctx.stroke();
+  ctx.fillStyle = 'rgba(140,255,110,0.95)';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  ctx.fillText(moneyStr, mx + mw - 10, my + 13);
+
+  // ── Botões de recompensa ─────────────────────────────────────────────────
+  const btnH = 22, btnY = my + 32, gap = 6;
+  const labels = [
+    { key:'manual', label: manualReady  ? '+ $100 ▶' : '⏳ $100', ready: manualReady  },
+    { key:'spring', label: springReady  ? '+ $1000 🌱': '🌱 $1000', ready: springReady },
+  ];
+
+  let bx = W - 10;
+  for (let i = labels.length - 1; i >= 0; i--) {
+    const {key, label, ready} = labels[i];
+    ctx.font = 'bold 10px Courier New';
+    const bw = ctx.measureText(label).width + 16;
+    bx -= bw;
+
+    // store hit area
+    REWARD_BTNS[key] = { x: bx, y: btnY, w: bw, h: btnH };
+
+    const pulse = ready ? (0.75 + 0.25 * Math.sin(ts * 0.006)) : 1;
+    ctx.fillStyle = ready ? `rgba(0,30,0,${0.85*pulse})` : 'rgba(0,0,0,0.55)';
+    roundRect(ctx, bx, btnY, bw, btnH, 4); ctx.fill();
+    ctx.strokeStyle = ready
+      ? `rgba(100,255,80,${0.8*pulse})`
+      : 'rgba(110,235,90,0.15)';
+    ctx.lineWidth = ready ? 1.2 : 0.6;
+    roundRect(ctx, bx, btnY, bw, btnH, 4); ctx.stroke();
+
+    if (ready) {
+      ctx.shadowColor = 'rgba(80,255,60,0.6)';
+      ctx.shadowBlur  = 6 * pulse;
+    }
+    ctx.fillStyle = ready ? `rgba(160,255,120,${pulse})` : 'rgba(110,235,90,0.28)';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, bx + bw/2, btnY + btnH/2);
+    ctx.shadowBlur = 0;
+
+    bx -= gap;
+  }
+
+  // ── Notificação de ganho ─────────────────────────────────────────────────
+  const age = ts - rewardNotifTs;
+  if (age < 1800) {
+    const a = Math.max(0, 1 - age / 1800);
+    const rise = age * 0.035;
+    ctx.font = 'bold 14px Courier New';
+    ctx.fillStyle = `rgba(180,255,120,${a})`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = `rgba(80,255,60,${a*0.8})`;
+    ctx.shadowBlur = 10;
+    ctx.fillText(`+$${rewardNotifAmt.toLocaleString()}`, W/2, H/2 - 60 - rise);
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+const vigGrad = hudCtx.createRadialGradient(W/2,H/2,0,W/2,H/2,W*0.68);
+vigGrad.addColorStop(0,'rgba(0,0,0,0)');
+vigGrad.addColorStop(1,'rgba(0,6,0,0.58)');
+
+/* ── SPRING RESET ───────────────────────── */
+function resetBladesForSpring() {
+  // Reposiciona todas as lâminas → novo padrão emergindo do zero
+  for (let idx=0; idx<tileData.length; idx++) {
+    const td=tileData[idx];
+    const {ti,tj}=td;
+    td.regionSum.fill(0); td.totalHeight=0; td.maxRegion=0;
+    let li=0, bPerLayer=Math.ceil(BPT/LAYERS), bladeCount=0;
+    for (const blade of td.blades) {
+      const oxW=tj*TILE, ozW=ti*TILE;
+      blade.wx  = oxW + 4 + Math.random()*(TILE-8);
+      blade.wz  = ozW + li*(TILE/LAYERS) + Math.random()*(TILE/LAYERS);
+      blade.height = MIN_H + Math.random()*3; // recomeça baixinha
+      blade.ri  = computeRI(blade, ti, tj);
+      fillBlade(blade.index, blade, li);
+      td.regionSum[blade.ri] += blade.height;
+      td.totalHeight += blade.height;
+      bladeCount++;
+      if (bladeCount % bPerLayer === 0) li = Math.min(li+1, LAYERS-1);
+    }
+    for (let r=0;r<td.regionSum.length;r++)
+      if (td.regionSum[r]>td.maxRegion) td.maxRegion=td.regionSum[r];
+  }
+  // atualiza TODOS os buffers no GPU
+  geometry.attributes.aOffset.needsUpdate = true;
+  geometry.attributes.aHeight.needsUpdate = true;
+  geometry.attributes.aColB.needsUpdate   = true;
+  geometry.attributes.aColM.needsUpdate   = true;
+  geometry.attributes.aColT.needsUpdate   = true;
+  growths = 0; // nova era, nova contagem!
+}
+
+/* ── SEASON UPDATE ──────────────────────── */
+function updateSeason() {
+  const simMin   = vtTotal / VTICKS_PER_MIN;
+  const cycleMin = simMin % CYCLE_MINS;
+  let phase;
+
+  if (cycleMin < SUMMER_END) {
+    /* ── VERÃO ── */
+    phase = 'summer';
+    seasonName = 'Verão';
+    winterness = clamp01(winterness - 0.004);   // volta a ficar verde
+    wiltMult   = clamp01(wiltMult   + 0.003);   // vigor cresce de volta
+
+  } else if (cycleMin < AUTUMN_END) {
+    /* ── OUTONO ── */
+    phase = 'autumn';
+    seasonName = 'Outono';
+    const t = (cycleMin - SUMMER_END) / (AUTUMN_END - SUMMER_END); // 0→1
+    winterness = clamp01(t * 0.55);             // começa a amarelar
+    wiltMult   = clamp01(1.0 - t * 0.25);       // levemente murchando
+
+  } else if (cycleMin < WINTER_END) {
+    /* ── INVERNO ── */
+    phase = 'winter';
+    seasonName = 'Inverno';
+    const t = (cycleMin - AUTUMN_END) / (WINTER_END - AUTUMN_END); // 0→1
+    winterness = clamp01(0.55 + t * 0.45);      // totalmente morta
+    wiltMult   = clamp01(0.75 - t * 0.75);      // some completamente
+
+  } else {
+    /* ── PRIMAVERA ── */
+    phase = 'spring';
+    seasonName = 'Primavera';
+    const t = (cycleMin - WINTER_END) / (SPRING_END - WINTER_END); // 0→1
+
+    // Trigger único: reposiciona todas as lâminas ao entrar na primavera
+    if (prevPhase === 'winter' && !springDone) {
+      springDone = true;
+      resetBladesForSpring();
+      springReady = true;  // recompensa de primavera disponível
+    }
+
+    winterness = clamp01(1.0 - t * 1.8);        // rapidamente reverdece
+    wiltMult   = clamp01(t * 1.3);              // emerge com vigor
+  }
+
+  if (phase === 'summer') springDone = false;   // libera próximo ciclo
+  prevPhase = phase;
+
+  material.uniforms.uWiltMult.value   = wiltMult;
+  material.uniforms.uWinterness.value = winterness;
+}
+
+/* ── CRESCIMENTO ────────────────────────── */
+function computeMaxLocalHeight(tileIdx, td, blade) {
+  const cap = buildingHeightCap(blade);
+  if (cap !== null) return cap;
+  const q = getTempIdeal(tileIdx);
+  const base = MIN_H + (MAX_H-MIN_H)*(0.12+0.88*q);
+  const fm = clamp(0.75 + 0.35*td.regionFertility[blade.ri], 0.80, 1.25);
+  return clamp(base*fm, MIN_H+2, MAX_H);
+}
+
+/* ── BUILDINGS ──────────────────────────── */
+// Cubo 66% do tile, centrado. Altura calculada para parecer cubo real na projeção.
+// Para cubo visual: a aresta lateral no ecrã tem comprimento = sqrt((S*IX)²+(S*IZ)²)
+// A aresta vertical = CH * IY → igualamos → CH = S * sqrt(IX²+IZ²) / IY
+const CUBE_S = TILE * 0.66;                                    // lado do footprint
+const CUBE_H = CUBE_S * Math.sqrt(IX*IX + IZ*IZ) / IY;        // altura visual = cubo real
+// Offset para centrar o cubo no tile
+const CUBE_OFF = (TILE - CUBE_S) / 2;
+
+const buildings = [];
+let buildingCounter = 0;
+let activeTool = null;
+let hoveredBuilding = null;
+
+const BUILD_STYLE = {
+  vila:    { top:'#9eaab5', side1:'#636e78', side2:'#454f57', icon:'🧑‍🦲' },
+  mina:    { top:'#8a9298', side1:'#575f65', side2:'#3a4145', icon:'🪨'   },
+  fazenda: { top:'#8fa88a', side1:'#576856', side2:'#3a4a39', icon:'🌱'   },
+};
+
+// Devolve o footprint world do cubo de um building {ox, oz, ox2, oz2}
+function cubeBox(b) {
+  const ox = b.tj*TILE + CUBE_OFF, oz = b.ti*TILE + CUBE_OFF;
+  return { ox, oz, ox2: ox+CUBE_S, oz2: oz+CUBE_S };
+}
+
+function setTool(t) {
+  if (activeTool === t) { activeTool = null; }
+  else { activeTool = t; selectedTile = null; }
+  document.querySelectorAll('.build-btn').forEach(b => b.classList.remove('active'));
+  if (activeTool) document.getElementById('tool-'+activeTool).classList.add('active');
+}
+
+function getBuildingAt(ti, tj) {
+  return buildings.find(b => b.ti===ti && b.tj===tj) || null;
+}
+
+function placeBuilding(ti, tj) {
+  if (getBuildingAt(ti, tj)) return;
+  const id = ++buildingCounter;
+  buildings.push({ id, type: activeTool, ti, tj });
+
+  // Zera todas as lâminas do tile inteiro
+  const td = tileData.find(t => t.ti===ti && t.tj===tj);
+  if (td) {
+    for (const blade of td.blades) {
+      blade.height = 0;
+      heightsArray[blade.index] = 0;
+    }
+    geometry.attributes.aHeight.needsUpdate = true;
+  }
+}
+
+// Colisão: impede rebrota no tile ocupado
+function buildingHeightCap(blade) {
+  for (const b of buildings) {
+    const ox = b.tj*TILE, oz = b.ti*TILE;
+    if (blade.wx >= ox && blade.wx < ox+TILE &&
+        blade.wz >= oz && blade.wz < oz+TILE) return 0;
+  }
+  return null;
+}
+
+
+function drawBuilding(b, ctx, ts) {
+  const { ox, oz, ox2, oz2 } = cubeBox(b);
+  const CH = CUBE_H;
+  const st = BUILD_STYLE[b.type];
+
+  // Vértices do topo (y = CH) e base (y = 0)
+  const t0=[projX(ox,  oz),  projY(ox,  CH, oz)];
+  const t1=[projX(ox2, oz),  projY(ox2, CH, oz)];
+  const t2=[projX(ox2, oz2), projY(ox2, CH, oz2)];
+  const t3=[projX(ox,  oz2), projY(ox,  CH, oz2)];
+  const b1=[projX(ox2, oz),  projY(ox2, 0,  oz)];
+  const b2=[projX(ox2, oz2), projY(ox2, 0,  oz2)];
+  const b3=[projX(ox,  oz2), projY(ox,  0,  oz2)];
+
+  ctx.save();
+
+  // Face lateral sul (esquerda visualmente)
+  ctx.beginPath();
+  ctx.moveTo(b3[0],b3[1]); ctx.lineTo(b2[0],b2[1]);
+  ctx.lineTo(t2[0],t2[1]); ctx.lineTo(t3[0],t3[1]);
+  ctx.closePath();
+  ctx.fillStyle = st.side1; ctx.fill();
+
+  // Face lateral leste (direita visualmente)
+  ctx.beginPath();
+  ctx.moveTo(b2[0],b2[1]); ctx.lineTo(b1[0],b1[1]);
+  ctx.lineTo(t1[0],t1[1]); ctx.lineTo(t2[0],t2[1]);
+  ctx.closePath();
+  ctx.fillStyle = st.side2; ctx.fill();
+
+  // Face de topo
+  ctx.beginPath();
+  ctx.moveTo(t0[0],t0[1]); ctx.lineTo(t1[0],t1[1]);
+  ctx.lineTo(t2[0],t2[1]); ctx.lineTo(t3[0],t3[1]);
+  ctx.closePath();
+  ctx.fillStyle = st.top; ctx.fill();
+
+  // Brilho metálico suave (reflexo especular)
+  const pulse = 0.72 + 0.28 * Math.sin(ts * 0.0012 + b.id * 1.3);
+  ctx.beginPath();
+  ctx.moveTo(t0[0],t0[1]); ctx.lineTo(t1[0],t1[1]);
+  ctx.lineTo(t2[0],t2[1]); ctx.lineTo(t3[0],t3[1]);
+  ctx.closePath();
+  ctx.fillStyle = `rgba(255,255,255,${0.10 * pulse})`; ctx.fill();
+
+  // Highlight na aresta do topo (cantos do cubo bem definidos)
+  ctx.strokeStyle = 'rgba(230,245,255,0.45)';
+  ctx.lineWidth = 1.2; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(t0[0],t0[1]); ctx.lineTo(t1[0],t1[1]);
+  ctx.lineTo(t2[0],t2[1]); ctx.lineTo(t3[0],t3[1]);
+  ctx.closePath(); ctx.stroke();
+
+  // Arestas verticais visíveis (mais finas)
+  ctx.strokeStyle = 'rgba(180,210,230,0.25)';
+  ctx.lineWidth = 0.7;
+  ctx.beginPath(); ctx.moveTo(t3[0],t3[1]); ctx.lineTo(b3[0],b3[1]); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(t2[0],t2[1]); ctx.lineTo(b2[0],b2[1]); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(t1[0],t1[1]); ctx.lineTo(b1[0],b1[1]); ctx.stroke();
+
+  // Ícone centrado no topo
+  const cx2d = (t0[0]+t1[0]+t2[0]+t3[0])/4;
+  const cy2d = (t0[1]+t1[1]+t2[1]+t3[1])/4 - 1;
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(st.icon, cx2d, cy2d);
+
+  ctx.restore();
+}
+
+function pointInPoly(px2, py2, poly) {
+  let inside = false;
+  for (let i=0, j=poly.length-1; i<poly.length; j=i++) {
+    const xi=poly[i][0], yi=poly[i][1], xj=poly[j][0], yj=poly[j][1];
+    if (((yi>py2)!==(yj>py2)) && (px2 < (xj-xi)*(py2-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+
+function buildingAtScreen(sx, sy) {
+  for (let k = buildings.length-1; k >= 0; k--) {
+    const b = buildings[k];
+    const { ox, oz, ox2, oz2 } = cubeBox(b);
+    const CH = CUBE_H;
+    const t0=[projX(ox,  oz),  projY(ox,  CH, oz)];
+    const t1=[projX(ox2, oz),  projY(ox2, CH, oz)];
+    const t2=[projX(ox2, oz2), projY(ox2, CH, oz2)];
+    const t3=[projX(ox,  oz2), projY(ox,  CH, oz2)];
+    const b1=[projX(ox2, oz),  projY(ox2, 0,  oz)];
+    const b3=[projX(ox,  oz2), projY(ox,  0,  oz2)];
+    const poly = [t0, t1, b1, t2, b3, t3];
+    if (pointInPoly(sx, sy, poly)) return b;
+  }
+  return null;
+}
+
+document.getElementById('hud-canvas').addEventListener('mousemove', e => {
+  const rect = e.target.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) * (W / rect.width);
+  const sy = (e.clientY - rect.top)  * (H / rect.height);
+  hoveredBuilding = buildingAtScreen(sx, sy);
+  e.target.style.cursor = hoveredBuilding ? 'default' : (activeTool ? 'crosshair' : 'pointer');
+});
+
+function drawBuildingTooltip(ctx, b, ts) {
+  if (!b) return;
+  const { ox, oz, ox2, oz2 } = cubeBox(b);
+  const CH = CUBE_H;
+  const topX = projX((ox+ox2)/2, (oz+oz2)/2);
+  const topY = projY((ox+ox2)/2, CH, (oz+oz2)/2);
+
+  const label = `#${b.id} · ${b.type.toUpperCase()}`;
+  ctx.save();
+  ctx.font = 'bold 11px Courier New';
+  const tw = ctx.measureText(label).width + 16;
+  const th = 20;
+  const tx = topX - tw/2;
+  const ty = topY - 40;
+
+  // fundo
+  ctx.fillStyle = 'rgba(8,12,18,0.88)';
+  roundRect(ctx, tx, ty, tw, th, 4); ctx.fill();
+  ctx.strokeStyle = 'rgba(140,190,255,0.55)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+
+  // texto
+  ctx.fillStyle = 'rgba(200,225,255,0.95)';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, topX, ty + th/2);
+  ctx.restore();
+}
+
+/* ── SPEED CONTROL ──────────────────────── */
+function setSpeed(s) {
+  simSpeed = s;
+  document.querySelectorAll('.speed-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('btn'+s).classList.add('active');
+}
+
+let flashBlade=null, flashTs=0;
+let selectedTile=null;
+
+/* ── SELEÇÃO DE TILE ────────────────────── */
+function screenToWorld(sx, sy) {
+  // Inverso da projeção isométrica (wy=0):
+  // sx = CX + (wx - wz)*IX  →  wx - wz = (sx - CX)/IX
+  // sy = CY + (wx + wz)*IZ  →  wx + wz = (sy - CY)/IZ
+  const dx = (sx - CX) / IX;
+  const dz = (sy - CY) / IZ;
+  return { wx: (dx + dz) / 2, wz: (dz - dx) / 2 };
+}
+
+function drawTileGlow(ctx, td, ts) {
+  const {ti, tj} = td;
+  const ox = tj * TILE, oz = ti * TILE;
+  const px = [
+    [projX(ox,       oz),        projY(ox,       0, oz)],
+    [projX(ox+TILE,  oz),        projY(ox+TILE,  0, oz)],
+    [projX(ox+TILE,  oz+TILE),   projY(ox+TILE,  0, oz+TILE)],
+    [projX(ox,       oz+TILE),   projY(ox,       0, oz+TILE)],
+  ];
+
+  // pulso suave
+  const pulse = 0.70 + 0.30 * Math.sin(ts * 0.004);
+
+  ctx.save();
+
+  // camadas de glow externo
+  const layers = [
+    { lw: 14, alpha: 0.10 * pulse },
+    { lw:  9, alpha: 0.22 * pulse },
+    { lw:  5, alpha: 0.42 * pulse },
+    { lw:  2, alpha: 0.85 * pulse },
+  ];
+
+  for (const {lw, alpha} of layers) {
+    ctx.beginPath();
+    ctx.moveTo(px[0][0], px[0][1]);
+    for (let i=1;i<4;i++) ctx.lineTo(px[i][0], px[i][1]);
+    ctx.closePath();
+    ctx.strokeStyle = `rgba(140,255,100,${alpha})`;
+    ctx.lineWidth   = lw;
+    ctx.lineJoin    = 'round';
+    ctx.shadowColor = `rgba(100,255,60,${alpha})`;
+    ctx.shadowBlur  = lw * 2.5;
+    ctx.stroke();
+  }
+
+  // contorno branco fino bem definido por cima
+  ctx.beginPath();
+  ctx.moveTo(px[0][0], px[0][1]);
+  for (let i=1;i<4;i++) ctx.lineTo(px[i][0], px[i][1]);
+  ctx.closePath();
+  ctx.strokeStyle = `rgba(220,255,180,${0.92 * pulse})`;
+  ctx.lineWidth   = 1.2;
+  ctx.shadowBlur  = 0;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+/* ── MAIN LOOP ──────────────────────────── */
+
+function loop(ts) {
+  let heightsUpdated = false;
+  const vtTicks = VTICKS_BASE * simSpeed;
+
+  for (let vt=0; vt<vtTicks; vt++) {
+    for (let tileIdx=0; tileIdx<tileData.length; tileIdx++) {
+      const td = tileData[tileIdx];
+      const p  = GROWTH_P * growthSpeedMult(tileIdx);
+      if (Math.random() >= p) continue;
+      const bi    = weightedPick(td);
+      const blade = td.blades[bi];
+      const maxLocal = computeMaxLocalHeight(tileIdx, td, blade);
+      if (blade.height >= maxLocal) continue;
+      const oldH  = blade.height;
+      blade.height = Math.min(blade.height + blade.height*GROWTH_AMT, maxLocal);
+      const actual = blade.height - oldH;
+      if (actual > 0) {
+        td.regionSum[blade.ri] += actual;
+        td.totalHeight += actual;
+        if (td.regionSum[blade.ri] > td.maxRegion) td.maxRegion = td.regionSum[blade.ri];
+        growths++;
+        heightsArray[blade.index] = blade.height;
+        heightsUpdated = true;
+        if (Math.random() < 0.015) { flashBlade=blade; flashTs=ts; }
+      }
+    }
+    vtTotal++;
+  }
+
+  // Checa se a recompensa manual está disponível
+  const simMinNow = vtTotal / VTICKS_PER_MIN;
+  if (!manualReady && simMinNow - lastRewardMin >= REWARD_INTERVAL_MINS) {
+    manualReady = true;
+  }
+
+  if (heightsUpdated) geometry.attributes.aHeight.needsUpdate = true;
+
+  updateTemps(vtTotal);
+  updateSeason();
+
+  /* render bg + chão */
+  bgCtx.fillStyle='#020804';
+  bgCtx.fillRect(0,0,W,H);
+  for (let k=0;k<tileOrder.length;k++) {
+    drawGround(tileOrder[k], bgCtx);
+  }
+
+  /* render WebGL */
+  material.uniforms.uTime.value = ts;
+  renderer.render(scene, camera);
+
+  /* render HUD */
+  hudCtx.clearRect(0,0,W,H);
+  if (flashBlade) {
+    const age=ts-flashTs;
+    if (age<700) {
+      const sx=projX(flashBlade.wx,flashBlade.wz);
+      const sy=projY(flashBlade.wx,flashBlade.height,flashBlade.wz);
+      const a=Math.max(0,1-age/700);
+      hudCtx.beginPath();
+      hudCtx.arc(sx,sy,2.5,0,Math.PI*2);
+      hudCtx.fillStyle=`rgba(200,255,100,${a*0.8})`;
+      hudCtx.fill();
+    }
+  }
+  hudCtx.fillStyle=vigGrad;
+  hudCtx.fillRect(0,0,W,H);
+  // Cubos sempre na frente da grama
+  for (let k=0;k<tileOrder.length;k++) {
+    const bldg = getBuildingAt(tileOrder[k].ti, tileOrder[k].tj);
+    if (bldg) drawBuilding(bldg, hudCtx, ts);
+  }
+  if (selectedTile) {
+    const std = tileData.find(td => td.ti===selectedTile.ti && td.tj===selectedTile.tj);
+    if (std) drawTileGlow(hudCtx, std, ts);
+  }
+  drawBuildingTooltip(hudCtx, hoveredBuilding, ts);
+  drawHUD(hudCtx, ts);
+
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
